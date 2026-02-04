@@ -7,6 +7,69 @@ const router = express.Router();
 
 /**
  * =========================
+ * POST /auth/register
+ * body: { firstName, lastName, username, email, mobile, password }
+ * =========================
+ */
+router.post("/register", async (req, res) => {
+  try {
+    const { firstName, lastName, username, email, mobile, password } = req.body;
+
+    if (!firstName || !lastName || !username || !email || !mobile || !password) {
+      return res.status(400).json({ message: "All fields are required." });
+    }
+
+    const usernameTrim = String(username).trim();
+    const emailLower = String(email).toLowerCase().trim();
+    const pass = String(password);
+
+    if (pass.length < 6) {
+      return res.status(400).json({ message: "Password must be at least 6 characters." });
+    }
+
+    // prevent duplicates
+    const exists = await User.findOne({
+      $or: [{ username: usernameTrim }, { email: emailLower }]
+    });
+
+    if (exists) {
+      return res.status(400).json({ message: "Username or email already exists." });
+    }
+
+    const passwordHash = await bcrypt.hash(pass, 10);
+
+    const user = await User.create({
+      firstName: String(firstName).trim(),
+      lastName: String(lastName).trim(),
+      username: usernameTrim,
+      email: emailLower,
+      mobile: String(mobile).trim(),
+      passwordHash,
+      isAdmin: false,
+      cart: [],
+      addresses: []
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: "Registered successfully",
+      user: {
+        id: user._id,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        username: user.username,
+        email: user.email,
+        mobile: user.mobile,
+        isAdmin: !!user.isAdmin
+      }
+    });
+  } catch (e) {
+    return res.status(500).json({ message: "Server error", error: e.message });
+  }
+});
+
+/**
+ * =========================
  * POST /auth/login
  * body: { identifier, password }
  * =========================
@@ -135,14 +198,11 @@ router.post("/create-admin", async (req, res) => {
       return res.status(400).json({ message: "Password must be at least 6 characters." });
     }
 
+    const usernameTrim = String(username).trim();
     const emailLower = String(email).toLowerCase().trim();
 
-    // prevent duplicates
     const exists = await User.findOne({
-      $or: [
-        { username: String(username).trim() },
-        { email: emailLower }
-      ]
+      $or: [{ username: usernameTrim }, { email: emailLower }]
     });
     if (exists) {
       return res.status(400).json({ message: "Username or email already exists." });
@@ -153,11 +213,13 @@ router.post("/create-admin", async (req, res) => {
     const admin = await User.create({
       firstName: String(firstName).trim(),
       lastName: String(lastName).trim(),
-      username: String(username).trim(),
+      username: usernameTrim,
       email: emailLower,
       mobile: String(mobile).trim(),
       passwordHash,
-      isAdmin: true
+      isAdmin: true,
+      cart: [],
+      addresses: []
     });
 
     return res.status(201).json({
