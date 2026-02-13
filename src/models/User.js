@@ -40,6 +40,9 @@ const UserSchema = new mongoose.Schema(
     // ✅ admin flag
     isAdmin: { type: Boolean, default: false },
 
+    // ✅ NEW: ban flag
+    isBanned: { type: Boolean, default: false },
+
     cart: { type: [CartItemSchema], default: [] },
     addresses: { type: [AddressSchema], default: [] },
 
