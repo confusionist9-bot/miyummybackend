@@ -1,10 +1,11 @@
+// src/routes/auth.routes.js
 const express = require("express");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 
 const User = require("../models/User");
-const RegisterOtp = require("../models/RegisterOtp"); // ✅ NEW
-const { sendRegisterOtpEmail } = require("../mailer"); // ✅ NEW
+const RegisterOtp = require("../models/RegisterOtp");
+const { sendRegisterOtpEmail } = require("../mailer");
 
 const router = express.Router();
 
@@ -40,15 +41,12 @@ router.post("/register-send-otp", async (req, res) => {
       { upsert: true, new: true }
     );
 
-    // respond immediately
-res.json({ success: true, message: "OTP sent" });
+    // ✅ IMPORTANT: wait for email send so errors show up
+    await sendRegisterOtpEmail(emailLower, otp);
 
-// send email in background (won't block mobile request)
-sendRegisterOtpEmail(emailLower, otp).catch((err) => {
-  console.error("sendRegisterOtpEmail error:", err.message);
-});
-
+    return res.json({ success: true, message: "OTP sent" });
   } catch (e) {
+    console.error("REGISTER SEND OTP ERROR:", e);
     return res.status(500).json({ message: "Server error", error: e.message });
   }
 });
@@ -77,7 +75,6 @@ router.post("/register-verify-otp", async (req, res) => {
     const ok = await bcrypt.compare(String(otp), rec.otpHash);
     if (!ok) return res.status(400).json({ message: "Invalid OTP" });
 
-    // ✅ short-lived token proving email ownership
     const registerOtpToken = jwt.sign(
       { email: emailLower, purpose: "register" },
       process.env.JWT_SECRET,
@@ -90,15 +87,14 @@ router.post("/register-verify-otp", async (req, res) => {
       registerOtpToken
     });
   } catch (e) {
+    console.error("REGISTER VERIFY OTP ERROR:", e);
     return res.status(500).json({ message: "Server error", error: e.message });
   }
 });
 
 /**
- * =========================
- * POST /auth/register
+ * ✅ POST /auth/register
  * body: { firstName, lastName, username, email, mobile, password, registerOtpToken }
- * =========================
  */
 router.post("/register", async (req, res) => {
   try {
@@ -109,14 +105,13 @@ router.post("/register", async (req, res) => {
       email,
       mobile,
       password,
-      registerOtpToken // ✅ REQUIRED NOW
+      registerOtpToken
     } = req.body;
 
     if (!registerOtpToken) {
       return res.status(400).json({ message: "Missing registerOtpToken" });
     }
 
-    // ✅ verify OTP token
     let payload;
     try {
       payload = jwt.verify(registerOtpToken, process.env.JWT_SECRET);
@@ -136,7 +131,6 @@ router.post("/register", async (req, res) => {
     const emailLower = String(email).toLowerCase().trim();
     const pass = String(password);
 
-    // ✅ must match verified email
     if (emailLower !== payload.email) {
       return res.status(400).json({ message: "Email does not match OTP verification." });
     }
@@ -145,7 +139,6 @@ router.post("/register", async (req, res) => {
       return res.status(400).json({ message: "Password must be at least 6 characters." });
     }
 
-    // prevent duplicates
     const exists = await User.findOne({
       $or: [{ username: usernameTrim }, { email: emailLower }]
     });
@@ -168,7 +161,6 @@ router.post("/register", async (req, res) => {
       addresses: []
     });
 
-    // cleanup
     await RegisterOtp.deleteOne({ email: emailLower });
 
     return res.status(201).json({
@@ -185,15 +177,14 @@ router.post("/register", async (req, res) => {
       }
     });
   } catch (e) {
+    console.error("REGISTER ERROR:", e);
     return res.status(500).json({ message: "Server error", error: e.message });
   }
 });
 
 /**
- * =========================
- * POST /auth/login
+ * ✅ POST /auth/login
  * body: { identifier, password }
- * =========================
  */
 router.post("/login", async (req, res) => {
   try {
@@ -235,16 +226,14 @@ router.post("/login", async (req, res) => {
       }
     });
   } catch (e) {
+    console.error("LOGIN ERROR:", e);
     return res.status(500).json({ message: "Server error", error: e.message });
   }
 });
 
 /**
- * =========================
- * POST /auth/admin-login
+ * ✅ POST /auth/admin-login
  * body: { identifier, password }
- * requires isAdmin === true
- * =========================
  */
 router.post("/admin-login", async (req, res) => {
   try {
@@ -270,9 +259,11 @@ router.post("/admin-login", async (req, res) => {
       return res.status(403).json({ message: "Admin only." });
     }
 
-    const token = jwt.sign({ userId: user._id, isAdmin: true }, process.env.JWT_SECRET, {
-      expiresIn: "7d"
-    });
+    const token = jwt.sign(
+      { userId: user._id, isAdmin: true },
+      process.env.JWT_SECRET,
+      { expiresIn: "7d" }
+    );
 
     return res.json({
       success: true,
@@ -285,16 +276,15 @@ router.post("/admin-login", async (req, res) => {
       }
     });
   } catch (e) {
+    console.error("ADMIN LOGIN ERROR:", e);
     return res.status(500).json({ message: "Server error", error: e.message });
   }
 });
 
 /**
- * =========================
- * POST /auth/create-admin
+ * ✅ POST /auth/create-admin
  * headers: x-admin-setup-key
  * body: { firstName, lastName, username, email, mobile, password }
- * =========================
  */
 router.post("/create-admin", async (req, res) => {
   try {
@@ -347,6 +337,7 @@ router.post("/create-admin", async (req, res) => {
       }
     });
   } catch (e) {
+    console.error("CREATE ADMIN ERROR:", e);
     return res.status(500).json({ message: "Server error", error: e.message });
   }
 });
