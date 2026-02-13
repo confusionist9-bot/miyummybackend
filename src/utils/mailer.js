@@ -22,8 +22,6 @@ function buildTransport() {
 
 async function sendOtpEmail(toEmail, otp) {
   const transporter = buildTransport();
-
-  // ✅ verify connection/auth (helps debug)
   await transporter.verify();
 
   const from = process.env.MAIL_FROM || process.env.SMTP_USER;
@@ -42,4 +40,25 @@ async function sendOtpEmail(toEmail, otp) {
   });
 }
 
-module.exports = { sendOtpEmail };
+// ✅ NEW: Registration OTP email
+async function sendRegisterOtpEmail(toEmail, otp) {
+  const transporter = buildTransport();
+  await transporter.verify();
+
+  const from = process.env.MAIL_FROM || process.env.SMTP_USER;
+
+  const subject = "MiYummy Registration Code";
+  const text =
+    `Your registration code is: ${otp}\n\n` +
+    `This code expires in 5 minutes.\n\n` +
+    `If you did not request this, you can ignore this email.`;
+
+  return transporter.sendMail({
+    from,
+    to: toEmail,
+    subject,
+    text
+  });
+}
+
+module.exports = { sendOtpEmail, sendRegisterOtpEmail };

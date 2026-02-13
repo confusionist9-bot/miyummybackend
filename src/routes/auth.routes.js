@@ -3,17 +3,125 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 
 const User = require("../models/User");
+const RegisterOtp = require("../models/RegisterOtp"); // ✅ NEW
+const { sendRegisterOtpEmail } = require("../mailer"); // ✅ NEW
+
 const router = express.Router();
+
+function gen4DigitOtp() {
+  return String(Math.floor(1000 + Math.random() * 9000));
+}
+
+/**
+ * ✅ POST /auth/register-send-otp
+ * body: { email }
+ */
+router.post("/register-send-otp", async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    if (!email) return res.status(400).json({ message: "email is required" });
+
+    const emailLower = String(email).toLowerCase().trim();
+
+    // block if already registered
+    const existing = await User.findOne({ email: emailLower });
+    if (existing) {
+      return res.status(400).json({ message: "Email already registered." });
+    }
+
+    const otp = gen4DigitOtp();
+    const otpHash = await bcrypt.hash(otp, 10);
+    const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 mins
+
+    await RegisterOtp.findOneAndUpdate(
+      { email: emailLower },
+      { otpHash, expiresAt },
+      { upsert: true, new: true }
+    );
+
+    await sendRegisterOtpEmail(emailLower, otp);
+
+    return res.json({ success: true, message: "OTP sent" });
+  } catch (e) {
+    return res.status(500).json({ message: "Server error", error: e.message });
+  }
+});
+
+/**
+ * ✅ POST /auth/register-verify-otp
+ * body: { email, otp }
+ * returns: { registerOtpToken }
+ */
+router.post("/register-verify-otp", async (req, res) => {
+  try {
+    const { email, otp } = req.body;
+
+    if (!email || !otp) {
+      return res.status(400).json({ message: "email and otp are required" });
+    }
+
+    const emailLower = String(email).toLowerCase().trim();
+    const rec = await RegisterOtp.findOne({ email: emailLower });
+
+    if (!rec) return res.status(400).json({ message: "OTP not found. Resend code." });
+    if (rec.expiresAt.getTime() < Date.now()) {
+      return res.status(400).json({ message: "OTP expired. Resend code." });
+    }
+
+    const ok = await bcrypt.compare(String(otp), rec.otpHash);
+    if (!ok) return res.status(400).json({ message: "Invalid OTP" });
+
+    // ✅ short-lived token proving email ownership
+    const registerOtpToken = jwt.sign(
+      { email: emailLower, purpose: "register" },
+      process.env.JWT_SECRET,
+      { expiresIn: "10m" }
+    );
+
+    return res.json({
+      success: true,
+      message: "OTP verified",
+      registerOtpToken
+    });
+  } catch (e) {
+    return res.status(500).json({ message: "Server error", error: e.message });
+  }
+});
 
 /**
  * =========================
  * POST /auth/register
- * body: { firstName, lastName, username, email, mobile, password }
+ * body: { firstName, lastName, username, email, mobile, password, registerOtpToken }
  * =========================
  */
 router.post("/register", async (req, res) => {
   try {
-    const { firstName, lastName, username, email, mobile, password } = req.body;
+    const {
+      firstName,
+      lastName,
+      username,
+      email,
+      mobile,
+      password,
+      registerOtpToken // ✅ REQUIRED NOW
+    } = req.body;
+
+    if (!registerOtpToken) {
+      return res.status(400).json({ message: "Missing registerOtpToken" });
+    }
+
+    // ✅ verify OTP token
+    let payload;
+    try {
+      payload = jwt.verify(registerOtpToken, process.env.JWT_SECRET);
+    } catch (e) {
+      return res.status(400).json({ message: "Invalid/expired OTP token" });
+    }
+
+    if (payload.purpose !== "register") {
+      return res.status(400).json({ message: "Invalid OTP token purpose" });
+    }
 
     if (!firstName || !lastName || !username || !email || !mobile || !password) {
       return res.status(400).json({ message: "All fields are required." });
@@ -22,6 +130,11 @@ router.post("/register", async (req, res) => {
     const usernameTrim = String(username).trim();
     const emailLower = String(email).toLowerCase().trim();
     const pass = String(password);
+
+    // ✅ must match verified email
+    if (emailLower !== payload.email) {
+      return res.status(400).json({ message: "Email does not match OTP verification." });
+    }
 
     if (pass.length < 6) {
       return res.status(400).json({ message: "Password must be at least 6 characters." });
@@ -49,6 +162,9 @@ router.post("/register", async (req, res) => {
       cart: [],
       addresses: []
     });
+
+    // cleanup
+    await RegisterOtp.deleteOne({ email: emailLower });
 
     return res.status(201).json({
       success: true,
@@ -86,9 +202,7 @@ router.post("/login", async (req, res) => {
     const pass = String(password);
 
     const isEmail = ident.includes("@");
-    const query = isEmail
-      ? { email: ident.toLowerCase() }
-      : { username: ident };
+    const query = isEmail ? { email: ident.toLowerCase() } : { username: ident };
 
     const user = await User.findOne(query);
     if (!user) return res.status(401).json({ message: "Invalid credentials." });
@@ -139,9 +253,7 @@ router.post("/admin-login", async (req, res) => {
     const pass = String(password);
 
     const isEmail = ident.includes("@");
-    const query = isEmail
-      ? { email: ident.toLowerCase() }
-      : { username: ident };
+    const query = isEmail ? { email: ident.toLowerCase() } : { username: ident };
 
     const user = await User.findOne(query);
     if (!user) return res.status(401).json({ message: "Invalid credentials." });
@@ -153,11 +265,9 @@ router.post("/admin-login", async (req, res) => {
       return res.status(403).json({ message: "Admin only." });
     }
 
-    const token = jwt.sign(
-      { userId: user._id, isAdmin: true },
-      process.env.JWT_SECRET,
-      { expiresIn: "7d" }
-    );
+    const token = jwt.sign({ userId: user._id, isAdmin: true }, process.env.JWT_SECRET, {
+      expiresIn: "7d"
+    });
 
     return res.json({
       success: true,
