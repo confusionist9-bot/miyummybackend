@@ -40,9 +40,14 @@ router.post("/register-send-otp", async (req, res) => {
       { upsert: true, new: true }
     );
 
-    await sendRegisterOtpEmail(emailLower, otp);
+    // respond immediately
+res.json({ success: true, message: "OTP sent" });
 
-    return res.json({ success: true, message: "OTP sent" });
+// send email in background (won't block mobile request)
+sendRegisterOtpEmail(emailLower, otp).catch((err) => {
+  console.error("sendRegisterOtpEmail error:", err.message);
+});
+
   } catch (e) {
     return res.status(500).json({ message: "Server error", error: e.message });
   }
