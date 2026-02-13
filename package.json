@@ -47,7 +47,10 @@
   "mongoose": "^9.1.5",
   
     
-  "nodemailer": "^7.0.12"
+  "nodemailer": "^7.0.12",
+  
+    
+  "resend": "^6.9.2"
   
   },
   
