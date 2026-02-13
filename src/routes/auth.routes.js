@@ -157,7 +157,6 @@ router.post("/register", async (req, res) => {
       mobile: String(mobile).trim(),
       passwordHash,
       isAdmin: false,
-      isBanned: false,
       cart: [],
       addresses: []
     });
@@ -206,11 +205,6 @@ router.post("/login", async (req, res) => {
 
     const ok = await bcrypt.compare(pass, user.passwordHash);
     if (!ok) return res.status(401).json({ message: "Invalid credentials." });
-
-    // ✅ BLOCK banned users
-    if (user.isBanned) {
-      return res.status(403).json({ message: "Your account has been banned." });
-    }
 
     const token = jwt.sign(
       { userId: user._id, isAdmin: !!user.isAdmin },
@@ -329,7 +323,6 @@ router.post("/create-admin", async (req, res) => {
       mobile: String(mobile).trim(),
       passwordHash,
       isAdmin: true,
-      isBanned: false,
       cart: [],
       addresses: []
     });
