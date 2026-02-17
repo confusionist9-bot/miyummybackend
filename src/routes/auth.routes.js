@@ -6,6 +6,7 @@ const jwt = require("jsonwebtoken");
 const User = require("../models/User");
 const RegisterOtp = require("../models/RegisterOtp");
 const { sendRegisterOtpEmail } = require("../mailer");
+const { sendOtpSmsInfobip } = require("../infobipSms");
 
 const router = express.Router();
 
@@ -13,8 +14,27 @@ function gen4DigitOtp() {
   return String(Math.floor(1000 + Math.random() * 9000));
 }
 
+// ✅ PH number -> E.164 (+63...)
+function normalizePHToE164(mobile) {
+  const raw = String(mobile || "").trim();
+
+  if (raw.startsWith("+63") && raw.length === 13) return raw;
+  if (raw.startsWith("63") && raw.length === 12) return "+" + raw;
+  if (raw.startsWith("09") && raw.length === 11) return "+63" + raw.slice(1);
+  if (raw.startsWith("9") && raw.length === 10) return "+63" + raw;
+
+  return null;
+}
+
+function maskPhone(e164) {
+  const digits = e164.replace("+", "");
+  if (digits.length < 12) return e164;
+  const last2 = digits.slice(-2);
+  return "+63 9** *** **" + last2;
+}
+
 /**
- * ✅ POST /auth/register-send-otp
+ * ✅ POST /auth/register-send-otp   (EMAIL OTP)
  * body: { email }
  */
 router.post("/register-send-otp", async (req, res) => {
@@ -35,13 +55,13 @@ router.post("/register-send-otp", async (req, res) => {
     const otpHash = await bcrypt.hash(otp, 10);
     const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 mins
 
+    // ✅ IMPORTANT: include email in update so upsert stores it
     await RegisterOtp.findOneAndUpdate(
       { email: emailLower },
-      { otpHash, expiresAt },
+      { email: emailLower, otpHash, expiresAt, phoneE164: undefined },
       { upsert: true, new: true }
     );
 
-    // ✅ IMPORTANT: wait for email send so errors show up
     await sendRegisterOtpEmail(emailLower, otp);
 
     return res.json({ success: true, message: "OTP sent" });
@@ -52,7 +72,7 @@ router.post("/register-send-otp", async (req, res) => {
 });
 
 /**
- * ✅ POST /auth/register-verify-otp
+ * ✅ POST /auth/register-verify-otp   (EMAIL OTP)
  * body: { email, otp }
  * returns: { registerOtpToken }
  */
@@ -93,6 +113,100 @@ router.post("/register-verify-otp", async (req, res) => {
 });
 
 /**
+ * ✅ POST /auth/register-send-sms-otp   (SMS OTP via INFOBIP)
+ * body: { mobile }
+ */
+router.post("/register-send-sms-otp", async (req, res) => {
+  try {
+    const { mobile } = req.body;
+
+    if (!mobile) return res.status(400).json({ message: "mobile is required" });
+
+    const phoneE164 = normalizePHToE164(mobile);
+    if (!phoneE164) return res.status(400).json({ message: "Invalid PH mobile number" });
+
+    const otp = gen4DigitOtp();
+    const otpHash = await bcrypt.hash(otp, 10);
+    const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 mins
+
+    // ✅ FIX: include phoneE164 in update so upsert stores it
+    await RegisterOtp.findOneAndUpdate(
+      { phoneE164 },
+      { phoneE164, otpHash, expiresAt, email: undefined },
+      { upsert: true, new: true }
+    );
+
+    const baseUrl = process.env.INFOBIP_BASE_URL; // xxxxx.api.infobip.com
+    const apiKey = process.env.INFOBIP_API_KEY;
+    const sender = process.env.INFOBIP_SENDER || "ServiceSMS";
+
+    if (!baseUrl || !apiKey) {
+      return res.status(500).json({ message: "Missing Infobip credentials" });
+    }
+
+    await sendOtpSmsInfobip({
+      baseUrl,
+      apiKey,
+      toE164: phoneE164,
+      from: sender,
+      text: `MiYummy OTP: ${otp} (valid 5 minutes)`
+    });
+
+    return res.json({
+      success: true,
+      message: "OTP sent",
+      destination: maskPhone(phoneE164)
+    });
+  } catch (e) {
+    console.error("REGISTER SEND SMS OTP ERROR:", e);
+    return res.status(500).json({ message: "Server error", error: e.message });
+  }
+});
+
+/**
+ * ✅ POST /auth/register-verify-sms-otp
+ * body: { mobile, otp }
+ * returns: { registerOtpToken }
+ */
+router.post("/register-verify-sms-otp", async (req, res) => {
+  try {
+    const { mobile, otp } = req.body;
+
+    if (!mobile || !otp) {
+      return res.status(400).json({ message: "mobile and otp are required" });
+    }
+
+    const phoneE164 = normalizePHToE164(mobile);
+    if (!phoneE164) return res.status(400).json({ message: "Invalid PH mobile number" });
+
+    const rec = await RegisterOtp.findOne({ phoneE164 });
+
+    if (!rec) return res.status(400).json({ message: "OTP not found. Resend code." });
+    if (rec.expiresAt.getTime() < Date.now()) {
+      return res.status(400).json({ message: "OTP expired. Resend code." });
+    }
+
+    const ok = await bcrypt.compare(String(otp), rec.otpHash);
+    if (!ok) return res.status(400).json({ message: "Invalid OTP" });
+
+    const registerOtpToken = jwt.sign(
+      { phoneE164, purpose: "register_sms" },
+      process.env.JWT_SECRET,
+      { expiresIn: "10m" }
+    );
+
+    return res.json({
+      success: true,
+      message: "OTP verified",
+      registerOtpToken
+    });
+  } catch (e) {
+    console.error("REGISTER VERIFY SMS OTP ERROR:", e);
+    return res.status(500).json({ message: "Server error", error: e.message });
+  }
+});
+
+/**
  * ✅ POST /auth/register
  * body: { firstName, lastName, username, email, mobile, password, registerOtpToken }
  */
@@ -119,7 +233,7 @@ router.post("/register", async (req, res) => {
       return res.status(400).json({ message: "Invalid/expired OTP token" });
     }
 
-    if (payload.purpose !== "register") {
+    if (payload.purpose !== "register" && payload.purpose !== "register_sms") {
       return res.status(400).json({ message: "Invalid OTP token purpose" });
     }
 
@@ -131,8 +245,14 @@ router.post("/register", async (req, res) => {
     const emailLower = String(email).toLowerCase().trim();
     const pass = String(password);
 
-    if (emailLower !== payload.email) {
+    const phoneE164 = normalizePHToE164(mobile);
+    if (!phoneE164) return res.status(400).json({ message: "Invalid PH mobile number" });
+
+    if (payload.purpose === "register" && emailLower !== payload.email) {
       return res.status(400).json({ message: "Email does not match OTP verification." });
+    }
+    if (payload.purpose === "register_sms" && phoneE164 !== payload.phoneE164) {
+      return res.status(400).json({ message: "Mobile does not match OTP verification." });
     }
 
     if (pass.length < 6) {
@@ -154,14 +274,18 @@ router.post("/register", async (req, res) => {
       lastName: String(lastName).trim(),
       username: usernameTrim,
       email: emailLower,
-      mobile: String(mobile).trim(),
+      mobile: phoneE164,
       passwordHash,
       isAdmin: false,
       cart: [],
       addresses: []
     });
 
-    await RegisterOtp.deleteOne({ email: emailLower });
+    await RegisterOtp.deleteOne(
+      payload.purpose === "register_sms"
+        ? { phoneE164 }
+        : { email: emailLower }
+    );
 
     return res.status(201).json({
       success: true,
@@ -233,7 +357,6 @@ router.post("/login", async (req, res) => {
 
 /**
  * ✅ POST /auth/admin-login
- * body: { identifier, password }
  */
 router.post("/admin-login", async (req, res) => {
   try {
@@ -283,8 +406,6 @@ router.post("/admin-login", async (req, res) => {
 
 /**
  * ✅ POST /auth/create-admin
- * headers: x-admin-setup-key
- * body: { firstName, lastName, username, email, mobile, password }
  */
 router.post("/create-admin", async (req, res) => {
   try {
