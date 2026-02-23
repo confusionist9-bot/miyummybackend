@@ -10,8 +10,9 @@ const { sendOtpSmsInfobip } = require("../infobipSms");
 
 const router = express.Router();
 
-function gen4DigitOtp() {
-  return String(Math.floor(1000 + Math.random() * 9000));
+// ✅ 6-digit OTP
+function gen6DigitOtp() {
+  return String(Math.floor(100000 + Math.random() * 900000));
 }
 
 // ✅ PH number -> E.164 (+63...)
@@ -51,7 +52,8 @@ router.post("/register-send-otp", async (req, res) => {
       return res.status(400).json({ message: "Email already registered." });
     }
 
-    const otp = gen4DigitOtp();
+    // ✅ 6-digit OTP
+    const otp = gen6DigitOtp();
     const otpHash = await bcrypt.hash(otp, 10);
     const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 mins
 
@@ -82,6 +84,11 @@ router.post("/register-verify-otp", async (req, res) => {
 
     if (!email || !otp) {
       return res.status(400).json({ message: "email and otp are required" });
+    }
+
+    // ✅ 6 digits only
+    if (!/^\d{6}$/.test(String(otp))) {
+      return res.status(400).json({ message: "OTP must be 6 digits" });
     }
 
     const emailLower = String(email).toLowerCase().trim();
@@ -125,7 +132,8 @@ router.post("/register-send-sms-otp", async (req, res) => {
     const phoneE164 = normalizePHToE164(mobile);
     if (!phoneE164) return res.status(400).json({ message: "Invalid PH mobile number" });
 
-    const otp = gen4DigitOtp();
+    // ✅ 6-digit OTP
+    const otp = gen6DigitOtp();
     const otpHash = await bcrypt.hash(otp, 10);
     const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 mins
 
@@ -174,6 +182,11 @@ router.post("/register-verify-sms-otp", async (req, res) => {
 
     if (!mobile || !otp) {
       return res.status(400).json({ message: "mobile and otp are required" });
+    }
+
+    // ✅ 6 digits only
+    if (!/^\d{6}$/.test(String(otp))) {
+      return res.status(400).json({ message: "OTP must be 6 digits" });
     }
 
     const phoneE164 = normalizePHToE164(mobile);
