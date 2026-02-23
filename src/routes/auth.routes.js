@@ -6,7 +6,7 @@ const jwt = require("jsonwebtoken");
 const User = require("../models/User");
 const RegisterOtp = require("../models/RegisterOtp");
 const { sendRegisterOtpEmail } = require("../mailer");
-const { sendOtpSmsInfobip } = require("../infobipSms");
+// const { sendOtpSmsInfobip } = require("../infobipSms");
 
 const router = express.Router();
 
