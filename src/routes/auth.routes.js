@@ -9,6 +9,14 @@ const User = require("../models/User");
 const router = express.Router();
 
 /**
+ * ✅ Config
+ * REQUIRE_FIREBASE_PHONE:
+ *  - "true"  => require firebaseIdToken + phone match (recommended for production)
+ *  - "false" => allow register without firebase (useful for dev/testing)
+ */
+const REQUIRE_FIREBASE_PHONE = String(process.env.REQUIRE_FIREBASE_PHONE || "true").toLowerCase() === "true";
+
+/**
  * ✅ Firebase Admin init (ONE TIME)
  * Put your service account JSON (string) in env FIREBASE_SERVICE_ACCOUNT_JSON
  */
@@ -29,11 +37,14 @@ function initFirebaseAdmin() {
     return;
   }
 
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
-  });
-
-  console.log("✅ Firebase Admin initialized");
+  try {
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+    });
+    console.log("✅ Firebase Admin initialized");
+  } catch (e) {
+    console.error("❌ Firebase Admin initializeApp failed:", e);
+  }
 }
 initFirebaseAdmin();
 
@@ -41,74 +52,133 @@ initFirebaseAdmin();
 function normalizePHToE164(mobile) {
   const raw = String(mobile || "").trim();
 
+  if (!raw) return null;
+
+  // already +63xxxxxxxxxx (13 chars: +63 + 10 digits)
   if (raw.startsWith("+63") && raw.length === 13) return raw;
+
+  // 63xxxxxxxxxx (12 chars)
   if (raw.startsWith("63") && raw.length === 12) return "+" + raw;
+
+  // 09xxxxxxxxx (11 chars)
   if (raw.startsWith("09") && raw.length === 11) return "+63" + raw.slice(1);
+
+  // 9xxxxxxxxx (10 chars)
   if (raw.startsWith("9") && raw.length === 10) return "+63" + raw;
 
   return null;
 }
 
+// ✅ helper: respond missing fields with a clear list
+function missingFields(obj, fields) {
+  const missing = [];
+  for (const f of fields) {
+    if (!obj[f] || String(obj[f]).trim() === "") missing.push(f);
+  }
+  return missing;
+}
+
 /**
  * ✅ POST /auth/register
- * body: { firstName, lastName, username, email, mobile, password, firebaseIdToken }
- *
- * Android side:
- * - Firebase phone OTP verifies user
- * - Get firebaseIdToken via currentUser.getIdToken(true)
- * - Send to backend here
+ * body:
+ * {
+ *   firstName, lastName, username, email,
+ *   mobile (or phone/phoneNumber), password,
+ *   firebaseIdToken
+ * }
  */
 router.post("/register", async (req, res) => {
   try {
-    const { firstName, lastName, username, email, mobile, password, firebaseIdToken } = req.body;
+    // accept common phone key variants from Android/frontend
+    const body = req.body || {};
 
-    if (!firebaseIdToken) {
-      return res.status(400).json({ success: false, message: "Missing firebaseIdToken" });
-    }
+    const firstName = body.firstName;
+    const lastName = body.lastName;
+    const username = body.username;
+    const email = body.email;
+    const password = body.password;
 
-    if (!firstName || !lastName || !username || !email || !mobile || !password) {
-      return res.status(400).json({ success: false, message: "All fields are required." });
+    // mobile can come from: mobile / phone / phoneNumber
+    const mobileRaw = body.mobile ?? body.phone ?? body.phoneNumber;
+    const firebaseIdToken = body.firebaseIdToken;
+
+    // ✅ validate required fields (always required)
+    const required = ["firstName", "lastName", "username", "email", "password"];
+    const missing = missingFields(
+      { firstName, lastName, username, email, password },
+      required
+    );
+
+    // mobile is always required in YOUR database schema logic
+    // but we validate it separately to show a better message
+    if (!mobileRaw || String(mobileRaw).trim() === "") missing.push("mobile");
+
+    if (missing.length) {
+      return res.status(400).json({
+        success: false,
+        message: "Missing required fields.",
+        missing, // ✅ makes debugging super easy on Android
+      });
     }
 
     if (String(password).length < 6) {
-      return res.status(400).json({ success: false, message: "Password must be at least 6 characters." });
-    }
-
-    // ✅ Verify Firebase ID token
-    if (!admin.apps.length) {
-      return res.status(500).json({
-        success: false,
-        message: "Firebase Admin not initialized. Check FIREBASE_SERVICE_ACCOUNT_JSON."
-      });
-    }
-
-    let decoded;
-    try {
-      decoded = await admin.auth().verifyIdToken(firebaseIdToken);
-    } catch (e) {
-      return res.status(401).json({ success: false, message: "Invalid/expired Firebase token" });
-    }
-
-    // ✅ Phone verified by Firebase
-    const firebasePhone = decoded.phone_number; // ex: +639xxxxxxxxx
-    if (!firebasePhone) {
       return res.status(400).json({
         success: false,
-        message: "Firebase token has no phone_number. Make sure user signed in via phone OTP."
+        message: "Password must be at least 6 characters.",
       });
     }
 
-    // ✅ Normalize the mobile user typed and compare to firebase phone
-    const phoneE164 = normalizePHToE164(mobile);
+    // ✅ Normalize PH mobile to E.164
+    const phoneE164 = normalizePHToE164(mobileRaw);
     if (!phoneE164) {
-      return res.status(400).json({ success: false, message: "Invalid PH mobile number" });
-    }
-
-    if (phoneE164 !== firebasePhone) {
       return res.status(400).json({
         success: false,
-        message: "Mobile number does not match the verified Firebase phone number."
+        message: "Invalid PH mobile number. Use 09xxxxxxxxx / 9xxxxxxxxx / 63xxxxxxxxxx / +63xxxxxxxxxx",
       });
+    }
+
+    // ✅ Firebase requirement (default ON)
+    if (REQUIRE_FIREBASE_PHONE) {
+      if (!firebaseIdToken) {
+        return res.status(400).json({
+          success: false,
+          message: "Missing firebaseIdToken (required).",
+        });
+      }
+
+      if (!admin.apps.length) {
+        return res.status(500).json({
+          success: false,
+          message: "Firebase Admin not initialized. Check FIREBASE_SERVICE_ACCOUNT_JSON.",
+        });
+      }
+
+      let decoded;
+      try {
+        decoded = await admin.auth().verifyIdToken(firebaseIdToken);
+      } catch (e) {
+        return res.status(401).json({
+          success: false,
+          message: "Invalid/expired Firebase token",
+        });
+      }
+
+      const firebasePhone = decoded.phone_number; // ex: +639xxxxxxxxx
+      if (!firebasePhone) {
+        return res.status(400).json({
+          success: false,
+          message: "Firebase token has no phone_number. Make sure user signed in via phone OTP.",
+        });
+      }
+
+      if (phoneE164 !== firebasePhone) {
+        return res.status(400).json({
+          success: false,
+          message: "Mobile number does not match the verified Firebase phone number.",
+          expected: firebasePhone,
+          received: phoneE164,
+        });
+      }
     }
 
     const usernameTrim = String(username).trim();
@@ -116,11 +186,14 @@ router.post("/register", async (req, res) => {
 
     // ✅ Prevent duplicates (username/email/mobile)
     const exists = await User.findOne({
-      $or: [{ username: usernameTrim }, { email: emailLower }, { mobile: phoneE164 }]
+      $or: [{ username: usernameTrim }, { email: emailLower }, { mobile: phoneE164 }],
     });
 
     if (exists) {
-      return res.status(400).json({ success: false, message: "Username, email, or mobile already exists." });
+      return res.status(400).json({
+        success: false,
+        message: "Username, email, or mobile already exists.",
+      });
     }
 
     const passwordHash = await bcrypt.hash(String(password), 10);
@@ -134,7 +207,7 @@ router.post("/register", async (req, res) => {
       passwordHash,
       isAdmin: false,
       cart: [],
-      addresses: []
+      addresses: [],
     });
 
     return res.status(201).json({
@@ -147,12 +220,16 @@ router.post("/register", async (req, res) => {
         username: user.username,
         email: user.email,
         mobile: user.mobile,
-        isAdmin: !!user.isAdmin
-      }
+        isAdmin: !!user.isAdmin,
+      },
     });
   } catch (e) {
     console.error("REGISTER ERROR:", e);
-    return res.status(500).json({ success: false, message: "Server error", error: e.message });
+    return res.status(500).json({
+      success: false,
+      message: "Server error",
+      error: e.message,
+    });
   }
 });
 
@@ -162,7 +239,7 @@ router.post("/register", async (req, res) => {
  */
 router.post("/login", async (req, res) => {
   try {
-    const { identifier, password } = req.body;
+    const { identifier, password } = req.body || {};
 
     if (!identifier || !password) {
       return res.status(400).json({ message: "identifier and password are required." });
@@ -180,6 +257,10 @@ router.post("/login", async (req, res) => {
     const ok = await bcrypt.compare(pass, user.passwordHash);
     if (!ok) return res.status(401).json({ message: "Invalid credentials." });
 
+    if (!process.env.JWT_SECRET) {
+      return res.status(500).json({ message: "Missing JWT_SECRET in environment." });
+    }
+
     const token = jwt.sign(
       { userId: user._id, isAdmin: !!user.isAdmin },
       process.env.JWT_SECRET,
@@ -196,8 +277,8 @@ router.post("/login", async (req, res) => {
         username: user.username,
         email: user.email,
         mobile: user.mobile,
-        isAdmin: !!user.isAdmin
-      }
+        isAdmin: !!user.isAdmin,
+      },
     });
   } catch (e) {
     console.error("LOGIN ERROR:", e);
@@ -210,7 +291,7 @@ router.post("/login", async (req, res) => {
  */
 router.post("/admin-login", async (req, res) => {
   try {
-    const { identifier, password } = req.body;
+    const { identifier, password } = req.body || {};
 
     if (!identifier || !password) {
       return res.status(400).json({ message: "identifier and password are required." });
@@ -232,6 +313,10 @@ router.post("/admin-login", async (req, res) => {
       return res.status(403).json({ message: "Admin only." });
     }
 
+    if (!process.env.JWT_SECRET) {
+      return res.status(500).json({ message: "Missing JWT_SECRET in environment." });
+    }
+
     const token = jwt.sign(
       { userId: user._id, isAdmin: true },
       process.env.JWT_SECRET,
@@ -245,8 +330,8 @@ router.post("/admin-login", async (req, res) => {
         id: user._id,
         username: user.username,
         email: user.email,
-        isAdmin: true
-      }
+        isAdmin: true,
+      },
     });
   } catch (e) {
     console.error("ADMIN LOGIN ERROR:", e);
@@ -256,7 +341,6 @@ router.post("/admin-login", async (req, res) => {
 
 /**
  * ✅ POST /auth/create-admin
- * (unchanged)
  */
 router.post("/create-admin", async (req, res) => {
   try {
@@ -265,7 +349,7 @@ router.post("/create-admin", async (req, res) => {
       return res.status(403).json({ message: "Forbidden" });
     }
 
-    const { firstName, lastName, username, email, mobile, password } = req.body;
+    const { firstName, lastName, username, email, mobile, password } = req.body || {};
 
     if (!firstName || !lastName || !username || !email || !mobile || !password) {
       return res.status(400).json({ message: "All fields are required." });
@@ -279,7 +363,7 @@ router.post("/create-admin", async (req, res) => {
     const emailLower = String(email).toLowerCase().trim();
 
     const exists = await User.findOne({
-      $or: [{ username: usernameTrim }, { email: emailLower }]
+      $or: [{ username: usernameTrim }, { email: emailLower }],
     });
     if (exists) {
       return res.status(400).json({ message: "Username or email already exists." });
@@ -296,7 +380,7 @@ router.post("/create-admin", async (req, res) => {
       passwordHash,
       isAdmin: true,
       cart: [],
-      addresses: []
+      addresses: [],
     });
 
     return res.status(201).json({
@@ -305,8 +389,8 @@ router.post("/create-admin", async (req, res) => {
         id: adminUser._id,
         username: adminUser.username,
         email: adminUser.email,
-        isAdmin: adminUser.isAdmin
-      }
+        isAdmin: adminUser.isAdmin,
+      },
     });
   } catch (e) {
     console.error("CREATE ADMIN ERROR:", e);
