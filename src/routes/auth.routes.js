@@ -2,74 +2,53 @@
 const express = require("express");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
-const admin = require("firebase-admin");
+const crypto = require("crypto");
+const mongoose = require("mongoose");
 
+// Models
 const User = require("../models/User");
+
+// ✅ Resend mailer (Forgot password email OTP)
+const { sendOtpEmail } = require("../mailer"); // adjust path if your mailer.js is in another folder
 
 const router = express.Router();
 
 /**
- * ✅ Config
- * REQUIRE_FIREBASE_PHONE:
- *  - "true"  => require firebaseIdToken + phone match (recommended for production)
- *  - "false" => allow register without firebase (useful for dev/testing)
+ * ===========================
+ * ENV FLAGS
+ * ===========================
+ * REQUIRE_PHONE_OTP:
+ *  - true  => Register requires phone OTP verification via TextBee (recommended)
+ *  - false => Register does NOT require OTP
  */
-const REQUIRE_FIREBASE_PHONE = String(process.env.REQUIRE_FIREBASE_PHONE || "true").toLowerCase() === "true";
+const REQUIRE_PHONE_OTP =
+  String(process.env.REQUIRE_PHONE_OTP || "true").toLowerCase() === "true";
 
 /**
- * ✅ Firebase Admin init (ONE TIME)
- * Put your service account JSON (string) in env FIREBASE_SERVICE_ACCOUNT_JSON
+ * TextBee envs:
+ *  - TEXTBEE_API_KEY
+ *  - TEXTBEE_DEVICE_ID
  */
-function initFirebaseAdmin() {
-  if (admin.apps.length) return;
+const TEXTBEE_API_KEY = process.env.TEXTBEE_API_KEY;
+const TEXTBEE_DEVICE_ID = process.env.TEXTBEE_DEVICE_ID;
 
-  const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-  if (!raw) {
-    console.warn("⚠️ Missing FIREBASE_SERVICE_ACCOUNT_JSON in env. Firebase Admin not initialized.");
-    return;
-  }
-
-  let serviceAccount;
-  try {
-    serviceAccount = JSON.parse(raw);
-  } catch (e) {
-    console.error("❌ FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON:", e);
-    return;
-  }
-
-  try {
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount),
-    });
-    console.log("✅ Firebase Admin initialized");
-  } catch (e) {
-    console.error("❌ Firebase Admin initializeApp failed:", e);
-  }
-}
-initFirebaseAdmin();
-
-// ✅ PH number -> E.164 (+63...)
+/**
+ * ===========================
+ * PHONE NORMALIZER (PH -> E.164)
+ * ===========================
+ */
 function normalizePHToE164(mobile) {
   const raw = String(mobile || "").trim();
-
   if (!raw) return null;
 
-  // already +63xxxxxxxxxx (13 chars: +63 + 10 digits)
   if (raw.startsWith("+63") && raw.length === 13) return raw;
-
-  // 63xxxxxxxxxx (12 chars)
   if (raw.startsWith("63") && raw.length === 12) return "+" + raw;
-
-  // 09xxxxxxxxx (11 chars)
   if (raw.startsWith("09") && raw.length === 11) return "+63" + raw.slice(1);
-
-  // 9xxxxxxxxx (10 chars)
   if (raw.startsWith("9") && raw.length === 10) return "+63" + raw;
 
   return null;
 }
 
-// ✅ helper: respond missing fields with a clear list
 function missingFields(obj, fields) {
   const missing = [];
   for (const f of fields) {
@@ -78,18 +57,242 @@ function missingFields(obj, fields) {
   return missing;
 }
 
+/* ===========================
+   OTP HELPERS (Forgot Password - EMAIL)
+   =========================== */
+function sha256(s) {
+  return crypto.createHash("sha256").update(String(s)).digest("hex");
+}
+
+function generateOtp4() {
+  return String(Math.floor(1000 + Math.random() * 9000));
+}
+
+/* ===========================
+   OTP HELPERS (REGISTER - PHONE via TextBee)
+   =========================== */
+function generateOtp6() {
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+// ✅ Simple fetch fallback for older Node (Node 18+ has global fetch)
+async function doFetch(url, options) {
+  if (typeof fetch === "function") return fetch(url, options);
+  // fallback if needed:
+  // npm i node-fetch
+  const fetchFn = (await import("node-fetch")).default;
+  return fetchFn(url, options);
+}
+
+async function sendSmsViaTextBee(toE164, message) {
+  if (!TEXTBEE_API_KEY || !TEXTBEE_DEVICE_ID) {
+    throw new Error("Missing TEXTBEE_API_KEY or TEXTBEE_DEVICE_ID in environment.");
+  }
+
+  const url = `https://api.textbee.dev/api/v1/gateway/devices/${TEXTBEE_DEVICE_ID}/send-sms`;
+
+  const res = await doFetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": TEXTBEE_API_KEY,
+    },
+    body: JSON.stringify({
+      recipients: [toE164],
+      message,
+    }),
+  });
+
+  const raw = await res.text();
+  if (!res.ok) {
+    throw new Error(`TextBee send failed (${res.status}): ${raw}`);
+  }
+
+  return true;
+}
+
+/**
+ * ===========================
+ * Phone OTP Mongo Model (inline)
+ * ===========================
+ * This avoids creating a separate file.
+ * TTL index auto deletes expired OTP docs.
+ */
+const PhoneOtpSchema = new mongoose.Schema(
+  {
+    phone: { type: String, required: true, index: true }, // E.164
+    otpHash: { type: String, required: true },
+    expiresAt: { type: Date, required: true, index: true },
+    used: { type: Boolean, default: false, index: true },
+    attempts: { type: Number, default: 0 },
+  },
+  { timestamps: true }
+);
+
+// TTL index: delete when expiresAt is reached
+PhoneOtpSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+
+const PhoneOtp =
+  mongoose.models.PhoneOtp || mongoose.model("PhoneOtp", PhoneOtpSchema);
+
+/**
+ * ✅ POST /auth/request-phone-otp
+ * body: { mobile }
+ * Sends OTP SMS using TextBee (for REGISTER)
+ */
+router.post("/request-phone-otp", async (req, res) => {
+  try {
+    const { mobile } = req.body || {};
+    const phoneE164 = normalizePHToE164(mobile);
+
+    if (!phoneE164) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Invalid PH mobile number. Use 09xxxxxxxxx / 9xxxxxxxxx / 63xxxxxxxxxx / +63xxxxxxxxxx",
+      });
+    }
+
+    // Optional: prevent sending OTP if number already registered
+    const exists = await User.findOne({ mobile: phoneE164 });
+    if (exists) {
+      return res.status(400).json({
+        success: false,
+        message: "Mobile already exists.",
+      });
+    }
+
+    const otp = generateOtp6();
+    const otpHash = await bcrypt.hash(otp, 10);
+
+    // invalidate previous OTPs for this phone
+    await PhoneOtp.updateMany(
+      { phone: phoneE164, used: false },
+      { $set: { used: true } }
+    );
+
+    const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes
+    await PhoneOtp.create({
+      phone: phoneE164,
+      otpHash,
+      expiresAt,
+      used: false,
+      attempts: 0,
+    });
+
+    await sendSmsViaTextBee(
+      phoneE164,
+      `MiYummy OTP: ${otp} (valid for 5 minutes)`
+    );
+
+    return res.json({
+      success: true,
+      message: "OTP sent via SMS.",
+    });
+  } catch (e) {
+    console.error("REQUEST PHONE OTP ERROR:", e);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to send OTP.",
+      error: e.message,
+    });
+  }
+});
+
+/**
+ * ✅ POST /auth/verify-phone-otp
+ * body: { mobile, otp }
+ * Verifies SMS OTP then returns a short-lived phoneOtpToken
+ */
+router.post("/verify-phone-otp", async (req, res) => {
+  try {
+    const { mobile, otp } = req.body || {};
+    const phoneE164 = normalizePHToE164(mobile);
+    const otpStr = String(otp || "").trim();
+
+    if (!phoneE164 || !otpStr) {
+      return res.status(400).json({
+        success: false,
+        message: "mobile and otp are required.",
+      });
+    }
+
+    const record = await PhoneOtp.findOne({
+      phone: phoneE164,
+      used: false,
+      expiresAt: { $gt: new Date() },
+    }).sort({ createdAt: -1 });
+
+    if (!record) {
+      return res.status(400).json({
+        success: false,
+        message: "Incorrect or expired verification code",
+      });
+    }
+
+    if (record.attempts >= 5) {
+      record.used = true;
+      await record.save();
+      return res.status(429).json({
+        success: false,
+        message: "Too many attempts. Request a new code.",
+      });
+    }
+
+    const ok = await bcrypt.compare(otpStr, record.otpHash);
+    record.attempts += 1;
+
+    if (!ok) {
+      await record.save();
+      return res.status(400).json({
+        success: false,
+        message: "Incorrect or expired verification code",
+      });
+    }
+
+    // mark as used
+    record.used = true;
+    await record.save();
+
+    if (!process.env.JWT_SECRET) {
+      return res.status(500).json({
+        success: false,
+        message: "Missing JWT_SECRET in environment.",
+      });
+    }
+
+    // short-lived token used only for REGISTER
+    const phoneOtpToken = jwt.sign(
+      { purpose: "register_phone_otp", phone: phoneE164 },
+      process.env.JWT_SECRET,
+      { expiresIn: "10m" }
+    );
+
+    return res.json({
+      success: true,
+      message: "OTP verified.",
+      phoneOtpToken,
+      phone: phoneE164,
+    });
+  } catch (e) {
+    console.error("VERIFY PHONE OTP ERROR:", e);
+    return res.status(500).json({
+      success: false,
+      message: "Server error",
+      error: e.message,
+    });
+  }
+});
+
 /**
  * ✅ POST /auth/register
- * body:
- * {
- *   firstName, lastName, username, email,
- *   mobile (or phone/phoneNumber), password,
- *   firebaseIdToken
- * }
+ * Now uses TextBee OTP token instead of Firebase token (when REQUIRE_PHONE_OTP=true)
+ *
+ * Expect body:
+ * { firstName,lastName,username,email,password,mobile, phoneOtpToken }
  */
 router.post("/register", async (req, res) => {
   try {
-    // accept common phone key variants from Android/frontend
     const body = req.body || {};
 
     const firstName = body.firstName;
@@ -98,26 +301,22 @@ router.post("/register", async (req, res) => {
     const email = body.email;
     const password = body.password;
 
-    // mobile can come from: mobile / phone / phoneNumber
     const mobileRaw = body.mobile ?? body.phone ?? body.phoneNumber;
-    const firebaseIdToken = body.firebaseIdToken;
+    const phoneOtpToken = body.phoneOtpToken;
 
-    // ✅ validate required fields (always required)
     const required = ["firstName", "lastName", "username", "email", "password"];
     const missing = missingFields(
       { firstName, lastName, username, email, password },
       required
     );
 
-    // mobile is always required in YOUR database schema logic
-    // but we validate it separately to show a better message
     if (!mobileRaw || String(mobileRaw).trim() === "") missing.push("mobile");
 
     if (missing.length) {
       return res.status(400).json({
         success: false,
         message: "Missing required fields.",
-        missing, // ✅ makes debugging super easy on Android
+        missing,
       });
     }
 
@@ -128,54 +327,53 @@ router.post("/register", async (req, res) => {
       });
     }
 
-    // ✅ Normalize PH mobile to E.164
     const phoneE164 = normalizePHToE164(mobileRaw);
     if (!phoneE164) {
       return res.status(400).json({
         success: false,
-        message: "Invalid PH mobile number. Use 09xxxxxxxxx / 9xxxxxxxxx / 63xxxxxxxxxx / +63xxxxxxxxxx",
+        message:
+          "Invalid PH mobile number. Use 09xxxxxxxxx / 9xxxxxxxxx / 63xxxxxxxxxx / +63xxxxxxxxxx",
       });
     }
 
-    // ✅ Firebase requirement (default ON)
-    if (REQUIRE_FIREBASE_PHONE) {
-      if (!firebaseIdToken) {
+    // ✅ Require SMS OTP verification for register (TextBee)
+    if (REQUIRE_PHONE_OTP) {
+      if (!phoneOtpToken) {
         return res.status(400).json({
           success: false,
-          message: "Missing firebaseIdToken (required).",
+          message: "Missing phoneOtpToken (required). Verify phone OTP first.",
         });
       }
 
-      if (!admin.apps.length) {
+      if (!process.env.JWT_SECRET) {
         return res.status(500).json({
           success: false,
-          message: "Firebase Admin not initialized. Check FIREBASE_SERVICE_ACCOUNT_JSON.",
+          message: "Missing JWT_SECRET in environment.",
         });
       }
 
       let decoded;
       try {
-        decoded = await admin.auth().verifyIdToken(firebaseIdToken);
+        decoded = jwt.verify(phoneOtpToken, process.env.JWT_SECRET);
       } catch (e) {
         return res.status(401).json({
           success: false,
-          message: "Invalid/expired Firebase token",
+          message: "Invalid/expired phoneOtpToken. Please verify OTP again.",
         });
       }
 
-      const firebasePhone = decoded.phone_number; // ex: +639xxxxxxxxx
-      if (!firebasePhone) {
-        return res.status(400).json({
+      if (decoded.purpose !== "register_phone_otp" || !decoded.phone) {
+        return res.status(401).json({
           success: false,
-          message: "Firebase token has no phone_number. Make sure user signed in via phone OTP.",
+          message: "Invalid phoneOtpToken payload.",
         });
       }
 
-      if (phoneE164 !== firebasePhone) {
+      if (decoded.phone !== phoneE164) {
         return res.status(400).json({
           success: false,
-          message: "Mobile number does not match the verified Firebase phone number.",
-          expected: firebasePhone,
+          message: "Mobile number does not match the verified phone.",
+          expected: decoded.phone,
           received: phoneE164,
         });
       }
@@ -184,9 +382,12 @@ router.post("/register", async (req, res) => {
     const usernameTrim = String(username).trim();
     const emailLower = String(email).toLowerCase().trim();
 
-    // ✅ Prevent duplicates (username/email/mobile)
     const exists = await User.findOne({
-      $or: [{ username: usernameTrim }, { email: emailLower }, { mobile: phoneE164 }],
+      $or: [
+        { username: usernameTrim },
+        { email: emailLower },
+        { mobile: phoneE164 },
+      ],
     });
 
     if (exists) {
@@ -210,9 +411,22 @@ router.post("/register", async (req, res) => {
       addresses: [],
     });
 
+    if (!process.env.JWT_SECRET) {
+      return res
+        .status(500)
+        .json({ success: false, message: "Missing JWT_SECRET in environment." });
+    }
+
+    const token = jwt.sign(
+      { userId: user._id, isAdmin: !!user.isAdmin },
+      process.env.JWT_SECRET,
+      { expiresIn: "7d" }
+    );
+
     return res.status(201).json({
       success: true,
       message: "Registered successfully",
+      token,
       user: {
         id: user._id,
         firstName: user.firstName,
@@ -235,14 +449,15 @@ router.post("/register", async (req, res) => {
 
 /**
  * ✅ POST /auth/login
- * body: { identifier, password }
  */
 router.post("/login", async (req, res) => {
   try {
     const { identifier, password } = req.body || {};
 
     if (!identifier || !password) {
-      return res.status(400).json({ message: "identifier and password are required." });
+      return res
+        .status(400)
+        .json({ message: "identifier and password are required." });
     }
 
     const ident = String(identifier).trim();
@@ -287,6 +502,148 @@ router.post("/login", async (req, res) => {
 });
 
 /**
+ * ✅ POST /auth/forgot-password
+ * body: { email }
+ * Sends OTP to email via Resend (mailer.js)
+ *
+ * Requires User schema fields:
+ * - resetOtpHash: String
+ * - resetOtpExpiresAt: Date
+ */
+router.post("/forgot-password", async (req, res) => {
+  try {
+    const { email } = req.body || {};
+    const emailLower = String(email || "").toLowerCase().trim();
+
+    if (!emailLower) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Email is required." });
+    }
+
+    const user = await User.findOne({ email: emailLower });
+    if (!user) {
+      return res.status(404).json({ success: false, message: "Email not found." });
+    }
+
+    const otp = generateOtp4();
+
+    user.resetOtpHash = sha256(otp);
+    user.resetOtpExpiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 mins
+    await user.save();
+
+    await sendOtpEmail(user.email, otp);
+
+    return res.json({
+      success: true,
+      message: "Code sent. Please check your email.",
+    });
+  } catch (e) {
+    console.error("FORGOT PASSWORD ERROR:", e);
+    return res
+      .status(500)
+      .json({ success: false, message: "Server error", error: e.message });
+  }
+});
+
+/**
+ * ✅ POST /auth/verify-otp
+ * body: { email, otp }
+ * For Forgot_pass2.kt (EMAIL OTP)
+ */
+router.post("/verify-otp", async (req, res) => {
+  try {
+    const { email, otp } = req.body || {};
+    const emailLower = String(email || "").toLowerCase().trim();
+    const otpStr = String(otp || "").trim();
+
+    if (!emailLower || !otpStr) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Email and OTP required." });
+    }
+
+    const user = await User.findOne({ email: emailLower });
+    if (!user) {
+      return res.status(404).json({ success: false, message: "Email not found." });
+    }
+
+    if (!user.resetOtpHash || !user.resetOtpExpiresAt) {
+      return res.status(400).json({ success: false, message: "No OTP requested." });
+    }
+
+    if (Date.now() > user.resetOtpExpiresAt.getTime()) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Incorrect or expired verification code" });
+    }
+
+    if (sha256(otpStr) !== user.resetOtpHash) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Incorrect or expired verification code" });
+    }
+
+    return res.json({ success: true, message: "OTP verified." });
+  } catch (e) {
+    console.error("VERIFY OTP ERROR:", e);
+    return res
+      .status(500)
+      .json({ success: false, message: "Server error", error: e.message });
+  }
+});
+
+/**
+ * ✅ POST /auth/reset-password
+ * body: { email, otp, newPassword }
+ * For Forgot_pass3.kt
+ */
+router.post("/reset-password", async (req, res) => {
+  try {
+    const { email, otp, newPassword } = req.body || {};
+    const emailLower = String(email || "").toLowerCase().trim();
+    const otpStr = String(otp || "").trim();
+
+    if (!emailLower || !otpStr || !newPassword) {
+      return res.status(400).json({ success: false, message: "Missing fields." });
+    }
+
+    if (String(newPassword).length < 6) {
+      return res.status(400).json({
+        success: false,
+        message: "Password must be at least 6 characters.",
+      });
+    }
+
+    const user = await User.findOne({ email: emailLower });
+    if (!user) {
+      return res.status(404).json({ success: false, message: "Email not found." });
+    }
+
+    if (
+      !user.resetOtpHash ||
+      !user.resetOtpExpiresAt ||
+      Date.now() > user.resetOtpExpiresAt.getTime() ||
+      sha256(otpStr) !== user.resetOtpHash
+    ) {
+      return res.status(400).json({ success: false, message: "Invalid or expired OTP." });
+    }
+
+    user.passwordHash = await bcrypt.hash(String(newPassword), 10);
+    user.resetOtpHash = null;
+    user.resetOtpExpiresAt = null;
+    await user.save();
+
+    return res.json({ success: true, message: "Password reset successful." });
+  } catch (e) {
+    console.error("RESET PASSWORD ERROR:", e);
+    return res
+      .status(500)
+      .json({ success: false, message: "Server error", error: e.message });
+  }
+});
+
+/**
  * ✅ POST /auth/admin-login
  */
 router.post("/admin-login", async (req, res) => {
@@ -294,7 +651,9 @@ router.post("/admin-login", async (req, res) => {
     const { identifier, password } = req.body || {};
 
     if (!identifier || !password) {
-      return res.status(400).json({ message: "identifier and password are required." });
+      return res
+        .status(400)
+        .json({ message: "identifier and password are required." });
     }
 
     const ident = String(identifier).trim();
@@ -317,11 +676,9 @@ router.post("/admin-login", async (req, res) => {
       return res.status(500).json({ message: "Missing JWT_SECRET in environment." });
     }
 
-    const token = jwt.sign(
-      { userId: user._id, isAdmin: true },
-      process.env.JWT_SECRET,
-      { expiresIn: "7d" }
-    );
+    const token = jwt.sign({ userId: user._id, isAdmin: true }, process.env.JWT_SECRET, {
+      expiresIn: "7d",
+    });
 
     return res.json({
       success: true,

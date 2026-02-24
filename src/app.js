@@ -25,7 +25,7 @@ app.use(
   cors({
     origin: "*",
     methods: ["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "x-admin-setup-key"]
+    allowedHeaders: ["Content-Type", "Authorization", "x-admin-setup-key", "x-api-key"],
   })
 );
 
@@ -40,7 +40,7 @@ app.get("/", (req, res) => {
 });
 
 // ✅ mount routes
-app.use("/auth", authRoutes);
+app.use("/auth", authRoutes);     // includes TextBee phone OTP endpoints now
 app.use("/me", meRoutes);
 app.use("/orders", orderRoutes);
 

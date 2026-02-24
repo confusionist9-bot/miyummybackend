@@ -44,7 +44,7 @@ const UserSchema = new mongoose.Schema(
     addresses: { type: [AddressSchema], default: [] },
 
     resetOtpHash: { type: String, default: null },
-    resetOtpExpires: { type: Date, default: null }
+    resetOtpExpiresAt: { type: Date, default: null },
   },
   { timestamps: true }
 );
