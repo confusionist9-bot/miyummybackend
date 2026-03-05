@@ -14,7 +14,7 @@ function getResend() {
 function getFrom() {
   // Works without domain verification using resend testing sender
   // (some accounts require verification for custom domains)
-  return process.env.MAIL_FROM || "MiYummy <onboarding@resend.dev>";
+  return process.env.MAIL_FROM || "MiYummy <no-reply@miyummymango.me>";
 }
 
 async function sendOtpEmail(toEmail, otp) {
